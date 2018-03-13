@@ -1,0 +1,489 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+#  rextract.py
+#
+#
+#  Created by TVA on 3/13/18.
+#  Copyright (c) 2018 rextract. All rights reserved.
+#
+
+import math
+import sys
+import shutil
+import subprocess
+import re
+import os
+
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'VERSION')) as f:
+    __version__ = f.read()
+
+
+EXIT_CODE_CANT_COMPILE_REGEX = 2
+
+
+def getVersionInfo():
+    return 'rextract version %s by Tim Savannah' %(__version__, )
+
+
+def usage():
+    sys.stderr.write('''Usage: rextract (Options) [regex pattern] ([output format])
+  Reads from stdin and applies provided regex pattern line-by-line,
+   optionally outputting in a format specified by "output format."
+
+ Options:
+ ========
+
+        --debug     Enable debug mode
+        --version   Print version and exit
+
+ Usage:
+ =====
+
+    Some examples of usage could be:
+  
+    * Extracting one or more groups from the input
+    * Omitting one or more groups from the input
+    * Rearranging the input
+    * Using some textual input (csv?) into a series of commands to execute
+    * Creating reports
+    * Many others!
+
+
+ Regex Pattern Format/Tips:
+ ==========================
+
+    rextract supports extended regular expression syntax (perl-style), specifically
+     that provided by the standard python "re" module.
+     Some examples can be found at https://docs.python.org/3/howto/regex.html
+
+
+    Each pattern contained within parenthesis counts as a group.
+    Each group left-to-right is assigned a numerical value, starting with 1.
+
+    You can assign a name to a group like so: 
+
+      (?P<my_group_name>[a-zA-Z][a-zA-Z0-9]+)
+
+      ^ This creates a group which you can reference as:
+
+        ${my_group_name}
+
+    A group must start with a letter a-z or underscore ( ' _' ),
+     and must only contain letters a-z (any case), numbers 0-9, or underscore.
+    Name a group like: (?P<name>.*)
+
+
+    The regular expression will match at any point within the line, unless
+    '^' (start of line) or '$' (end of line) are present, in which case it
+    will have to match with those restrictions.
+
+    Thus, there is no need to prefix with '.*' to be able to match somewhere
+    in the center.
+     
+
+ Output Format
+ =============
+
+    The "Output Format" argument can be though of exactly like a bash string -
+      characters all have their literal value except those preceded with an
+      un-escaped dollar ( $ ) sign. These represent groups, either numeric or
+      by-name. See the section above for more info on creating groups.
+
+    If the "Output Format" argument is omitted, the entire matched region will
+      be printed, line-by-line. This is equivalent to providing an 
+      "Output Format" of '${0}'.
+
+  Numeric Groups
+  --------------
+
+    Use ${1} or $1 for the first group, and ${3} for the third.
+      Numerical groups are assigned left-to-right as they appear in the regex,
+      even if the group is in a conditional, and despite nesting.
+
+      For example:
+        "((yellow|white) cheddar)|((whole|part-skim) mozerella)"
+        
+      "yellow|white cheddar" is the first group,
+      "yellow|white" is the second group
+      "whole|part-skim mozerella" is the third group
+      "whole|part-skim" is the fourth group.
+
+      If a group is not matched, it is assigned the value of an empty string.
+
+    Use the special group $0 or ${0]} to print the entire matched section.
+
+  Named Groups
+  ------------
+
+    If you defined any groups to have a name (see section above on this topic),
+      i.e. (?P<my_group>...) , then you can reference that group in the output
+      as $my_group or ${my_group}.
+
+
+  NOTE: Make sure to single-quote the "Output Format" argument,
+    or escape dollar [$] signs (by using \$).
+''')
+    sys.stderr.write('\n%s\n\n' %(getVersionInfo(), ))
+
+
+# isDebug - Global "Debug" flag. Will print extra info.
+isDebug = False
+
+class MatchPrinter(object):
+    '''
+        MatchPrinter - Main class for dealing with matching and printing
+    '''
+
+    def __init__(self, outputFormat):
+        '''
+            __init__ - Construct.
+
+            @param outputFormat <str> - The requested output match string (see #usage method for format).
+        '''
+
+        # self.outputFormat - The requested output format (string with bash-style variables
+        #  for marking where matched groups should be inserted)
+        self.outputFormat = outputFormat
+
+        # self.printNames - Named groups in outputStr.
+        #  Example:
+        #    (?P<abc>[0-9]+)  in 'reg pattern' argument defines group "abc" as 1+ digits
+        #    $abc or ${abc} in 
+        self.printNames = []
+        self.printGroups = []
+
+        if outputFormat:
+            self.outputFormat = outputFormat = outputFormat.replace("\\t", "\t")
+            # A valid group name starts with a-z or A-Z or _, then may contain those or in addition 0-9 for
+            #  following characters.
+            matchNames = re.findall(r'[$][\{]{0,1}(?P<name>[a-zA-Z0-9_]+)[\}]{0,1}', outputFormat)
+            for name in matchNames:
+                if name.isdigit():
+                    self.printGroups.append(int(name))
+                else:
+                    if name[0].isdigit():
+                        sys.stderr.write('ERR: Group names cannot start with a number. Must start with a-z, A-Z, or _.\n')
+                        sys.exit(1)
+                    self.printNames.append(name)
+
+            self.printGroups = list(set(self.printGroups))
+            self.printNames = list(set(self.printNames))
+
+
+    def printMatchStr(self, matchObj):
+        '''
+            printMatchStr - Print a match, formatted to "outputFormat" as provided in __init__
+
+            @param matchObj <SRE_Match object> - A match object
+        '''
+
+        line = matchObj.string
+        outputFormat = self.outputFormat
+
+        global isDebug
+
+        if not outputFormat:
+            sys.stdout.write ( matchObj.groups()[0] )
+            return
+
+        groupDict = matchObj.groupdict()
+        orderedGroups = list(matchObj.groups())
+
+        # Any unmatched but present keys (like entire group is in an "or" 
+        #   condition within expression), replace with empty string.
+        for key in groupDict:
+            if groupDict[key] is None:
+                groupDict[key] = ''
+
+        for i in range(len(orderedGroups)):
+            if orderedGroups[i] is None:
+                orderedGroups[i] = ''
+
+        orderedGroups = tuple(orderedGroups)
+
+        for printGroup in self.printGroups:
+            try:
+                toReplace = r'[$][\{]{0,1}%d[\}]{0,1}' %(printGroup,)
+                if printGroup == 0:
+                    replaceWith = matchObj.string[matchObj.start() : matchObj.end()]
+                    replaceWith = orderedGroups[0]
+                else:
+                    replaceWith = orderedGroups[printGroup]
+
+                outputFormat = re.sub(toReplace, replaceWith, outputFormat)
+            except Exception as e:
+                if isDebug is True:
+                    sys.stderr.write('DEBUG: Got exception replacing ${%d} : %s\n' %(printGroup, str(e)))
+
+
+        for printName in self.printNames:
+            try:
+                toReplace = r'[$][\{]{0,1}%s[\}]{0,1}' %(printName, )
+
+                if printName in groupDict:
+                    replaceWith = groupDict[printName]
+                else:
+                    replaceWith = ''
+                    if isDebug is True:
+                        sys.stderr.write('DEBUG: No group found matching name: %s\n' %(printName,))
+
+                outputFormat = re.sub(toReplace, replaceWith, outputFormat)
+
+            except Exception as e:
+                if isDebug is True:
+                    sys.stderr.write('DEBUG: Got exception replacing ${%s} : %s\n' %(printName, str(e)))
+
+        sys.stdout.write ( outputFormat )
+
+
+
+
+def strToBlocks(toConvert, blockSize):
+    '''
+        strToBlocks - Split a string into blocks, of max #blockSize
+
+        @param toConvert <str> - String to convert
+        @param blockSize <int> - Max number of items per block
+
+        @return - List of the string split up into blocks.
+    '''
+    ret = []
+    i = 0
+    lastI = 0
+    toConvertLen = len(toConvert)
+    if toConvertLen == 0:
+        return ['']
+
+    while i < toConvertLen:
+        i += blockSize
+
+        ret.append( toConvert[lastI : i] )
+
+        lastI = i
+
+
+    return ret
+
+
+# Python3 seems to support this, and may work on windoze..
+if hasattr(shutil, 'get_terminal_size'):
+    def getNumColsTerminal():
+        '''
+            getNumColsTerminal - Gets number of columns in terminal window
+        '''
+        return shutil.get_terminal_size()[0]
+else:
+    # These only work on linux/unix systems, and probably cygwin
+    def getNumColsTerminal():
+        '''
+            getNumColsTerminal - Gets number of columns in terminal window,
+                or None if cannot determine.
+        '''
+        # Try tput first
+        contents = None
+        ret = 127
+        try:
+            pipe = subprocess.Popen('tput cols', shell=True, stdout=subprocess.PIPE)
+            contents = pipe.stdout.read().decode('ascii')
+            ret = pipe.wait()
+        except:
+            pass
+
+        if ret == 0 and contents:
+            return int(contents.strip())
+
+        # Otherwise, try stty size
+        contents = None
+        ret = 127
+        try:
+            pipe = subprocess.Popen('stty size', shell=True, stdout=subprocess.PIPE)
+            contents = pipe.stdout.read().decode('ascii')
+            ret = pipe.wait()
+        except:
+            pass
+
+        if ret == 0 and contents:
+            # stty returns rows[space]cols
+            return int(contents.strip().split(' ')[1])
+
+        # Could not determine
+        return None
+
+def handleParseError(pattern, exception):
+    '''
+        handleParseError - Print the error, and then print the pattern
+          with a caret ( ^ ) pointing at the error position.
+
+          This only works in python3, as python2's regex engine doesn't specify an error offset
+
+        @param pattern <str> - String of regex pattern.
+          It makes more sense on failure to recompile the original pattern and pass that exception
+          plus the original pattern. Otherwise, may confuse users.
+
+        @param exception <Exception> - exception raised when compiling pattern
+
+    '''
+
+    # TODO: Provide tips on some common error message.
+
+    # On python 3 (and maybe eventually backported to 2.7, though not yet
+    #  as of 2.7.12 ) the regex engine reports position of syntax error
+    posRE = re.compile('.*at position (?P<pos>[\d]+)')
+
+    exceptionMsg = str(exception)
+
+    try:
+        errorPos = int(posRE.match(exceptionMsg).groupdict()['pos'])
+    except:
+        # Could not extract a number, so just print error message and pattern.
+        sys.stderr.write('\nERR: Cannot compile pattern: %s\n\n%s\n' %(exceptionMsg, pattern))
+        return
+
+
+    foundCols = getNumColsTerminal()
+    if foundCols:
+        numCols = foundCols
+    else:
+        # If we couldn't determine number of columns, assume 80.
+        numCols = 80
+
+    # Give us a little buffer room on the right
+    numCols -= 4
+
+    if numCols <= 12:
+        # Some very small window here, just give up.
+        sys.stderr.write('\nERR: Cannot compile pattern: %s\n\n%s\n' %(exceptionMsg, pattern))
+        return
+
+
+    # Split up our lines so they fit in the available columns
+    blockedPattern = strToBlocks(pattern, numCols)
+
+    # Discover which line contains the error
+    lineContainingError = math.floor(errorPos / numCols)
+    if float(lineContainingError) == float(errorPos) / float(numCols):
+        # If this is true, we are actually on the last character of line.
+        #  or, we are on the first character of the first line (hence the min)
+        lineContainingError = min(lineContainingError - 1, 0)
+
+    i = 0
+
+    write = sys.stderr.write
+
+    # Show error on first line
+    write('\nERR: Cannot compile pattern: %s\n\n' %(exceptionMsg,))
+
+    # Lines before the one containing error
+    while i < lineContainingError:
+        write(blockedPattern[i])
+        write('\n')
+        i += 1
+
+    # Caret points to this upcoming line
+    if errorPos == 0:
+        caretPos = 0
+    else:
+        caretPos = errorPos % numCols
+        if caretPos == 0:
+            caretPos = len(blockedPattern[i])
+
+    write(blockedPattern[i])
+    write('\n')
+    write(' ' * ( caretPos - 1))
+    write('^')
+    write('\n')
+
+    i += 1
+
+    # If we have lines after this, give some padding so arrow is obvious
+    if i < len(blockedPattern):
+        write('\n')
+
+    # Lines after error
+    while i < len(blockedPattern):
+        write(blockedPattern[i])
+        write('\n')
+        i += 1
+
+    write('\n')
+
+
+def main():
+
+    try:
+
+        args = sys.argv[1:]
+
+        if '--debug' in args:
+            args.remove('--debug')
+            isDebug = True
+
+        if '--version' in args:
+            sys.stderr.write('%s\n\n' %(getVersionInfo(), ))
+            sys.exit(0)
+
+        if '--help' in args or len(args) < 1:
+            usage()
+            sys.exit(1)
+
+        pattern = args[0]
+
+        origPattern = pattern[:]
+
+        pattern = ''.join(['(', pattern, ')'])
+
+        # Try to compile the pattern. If we fail, recompile with the original
+        #  pattern, and pass to "handleParseError", where we will output the
+        #  entire RE, and point to the location of the error.
+        try:
+            regex = re.compile(pattern)
+        except Exception as failedParseModifiedException:
+            try:
+                regex = re.compile(origPattern)
+            except Exception as failedParseOrigException:
+                handleParseError(origPattern, failedParseOrigException)
+                sys.exit(EXIT_CODE_CANT_COMPILE_REGEX)
+
+            sys.stderr.write('WARNING: Failed to parse modified regex, but original parsed?\n')
+            handleParseError(pattern, failedParseModifiedException)
+
+        if len(args) == 1:
+            outputFormat = ''
+        else:
+            outputFormat = ' '.join(args[1:])
+            if not outputFormat:
+                sys.stderr.write('Warning: match string provided but empty. Did you forget to use single-quotes or escape $?\n')
+
+        matchPrinter = MatchPrinter(outputFormat)
+
+        try:
+            _readline = sys.stdin.buffer.readline
+            defaultEncoding = sys.getdefaultencoding()
+            def readline():
+                line = _readline()
+                return line.decode(defaultEncoding)
+
+        except AttributeError:
+            readline = _readline = sys.stdin.readline
+
+        
+        line = None
+        while True:
+            try:
+                line = readline()
+            except UnicodeDecodeError as ude:
+                if isDebug:
+                    sys.stderr.write("Couldn't decode line: %s\n" %(str(ude),))
+                continue
+
+            if line in (b'', ''):
+                break
+
+            matchObj = regex.search(line)
+            if matchObj:
+                matchPrinter.printMatchStr(matchObj)
+
+        sys.exit(0)
+    except KeyboardInterrupt:
+        pass

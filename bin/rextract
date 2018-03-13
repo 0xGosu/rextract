@@ -1,0 +1,15 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+#  rextract
+#
+#
+#  Created by TVA on 3/13/18.
+#  Copyright (c) 2018 rextract. All rights reserved.
+
+import sys
+import os
+from rextract import main
+
+if __name__ == '__main__':
+    result = main()
